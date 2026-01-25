@@ -33,13 +33,13 @@
     },
     "platformConfig": {
         "macos": {
-            "bundleId": "com.shirokol33t.crevasse"
+            "bundleId": "jp.shirokol33t.crevasse"
         }
     },
     "name": "crevasse",
     "displayName": "Crevasse",
     "version": "1.0.0",
-    "author": "@ShirokoLEET",
-    "website": "https://github.com/ShirokoLEET/Crevasse",
-    "email": "me@example.com"
+    "author": "1-6-1-9-k-H-z",
+    "website": "girlsbandcry.top",
+    "email": "never@try.catchme"
 }
