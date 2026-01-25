@@ -33,13 +33,13 @@
     },
     "platformConfig": {
         "macos": {
-            "bundleId": "com.example.plugintemplate-for-obs"
+            "bundleId": "com.shirokol33t.crevasse"
         }
     },
-    "name": "plugintemplate-for-obs",
-    "displayName": "Plugin Template for OBS",
+    "name": "crevasse",
+    "displayName": "Crevasse",
     "version": "1.0.0",
-    "author": "Your Name Here",
-    "website": "https://example.com",
+    "author": "@ShirokoLEET",
+    "website": "https://github.com/ShirokoLEET/Crevasse",
     "email": "me@example.com"
 }
