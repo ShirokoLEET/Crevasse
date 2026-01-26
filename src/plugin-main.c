@@ -1,48 +1,35 @@
 #include <obs-module.h>
+#include <plugin-support.h>
+#include <graphics/graphics.h>
+#include <d3d11.h>
+
+OBS_DECLARE_MODULE()
+OBS_MODULE_USE_DEFAULT_LOCALE(PLUGIN_NAME, "en-US")
 
 struct crevasse_filter {
 	obs_source_t *source;
-	gs_effect_t *effect;
 };
 
 static const char *filter_getname(void *unused)
 {
 	UNUSED_PARAMETER(unused);
-	return "Crevasse - ai";
+	return "Crevasse_ai";
 }
 
 static void filter_destroy(void *data)
 {
 	struct crevasse_filter *tf = data;
+	if (!tf)
+		return;
 
-	if (tf) {
-		obs_enter_graphics();
-
-		gs_effect_destroy(tf->effect);
-		bfree(tf);
-
-		obs_leave_graphics();
-	}
+	bfree(tf);
 }
 
 static void *filter_create(obs_data_t *settings, obs_source_t *source)
 {
 	struct crevasse_filter *tf = bzalloc(sizeof(struct crevasse_filter));
-	char *effect_file;
-
-	obs_enter_graphics();
-
-	effect_file = obs_module_file("test.effect");
 
 	tf->source = source;
-	tf->effect = gs_effect_create_from_file(effect_file, NULL);
-	bfree(effect_file);
-	if (!tf->effect) {
-		filter_destroy(tf);
-		tf = NULL;
-	}
-
-	obs_leave_graphics();
 
 	UNUSED_PARAMETER(settings);
 	return tf;
@@ -50,18 +37,30 @@ static void *filter_create(obs_data_t *settings, obs_source_t *source)
 
 static void filter_render(void *data, gs_effect_t *effect)
 {
-	struct crevasse_filter *tf = data;
+	UNUSED_PARAMETER(effect);
 
-	if (!obs_source_process_filter_begin(tf->source, GS_RGBA, OBS_ALLOW_DIRECT_RENDERING))
+	struct crevasse_filter *tf = data;
+	if (!tf)
 		return;
 
-	obs_source_process_filter_end(tf->source, tf->effect, 0, 0);
+	obs_source_t *target = obs_filter_get_target(tf->source);
 
-	UNUSED_PARAMETER(effect);
+	if (!obs_source_process_filter_begin(tf->source, GS_RGBA, OBS_ALLOW_DIRECT_RENDERING)) {
+		obs_source_skip_video_filter(tf->source);
+		return;
+	}
+
+	gs_texture_t *rt = gs_get_render_target();
+	ID3D11Texture2D *d3d_tex = rt ? (ID3D11Texture2D *)gs_texture_get_obj(rt) : NULL;
+
+	gs_effect_t *default_effect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
+	const uint32_t cx = obs_source_get_base_width(target);
+	const uint32_t cy = obs_source_get_base_height(target);
+	obs_source_process_filter_end(tf->source, default_effect, cx, cy);
 }
 
-struct obs_source_info crevasse_filter = {
-	.id = "crevasse_filter",
+struct obs_source_info crevasse_ai = {
+	.id = "crevasse_ai",
 	.type = OBS_SOURCE_TYPE_FILTER,
 	.output_flags = OBS_SOURCE_VIDEO,
 	.get_name = filter_getname,
@@ -69,3 +68,15 @@ struct obs_source_info crevasse_filter = {
 	.destroy = filter_destroy,
 	.video_render = filter_render,
 };
+
+bool obs_module_load(void)
+{
+	obs_register_source(&crevasse_ai);
+	obs_log(LOG_INFO, "plugin loaded successfully (version %s)", PLUGIN_VERSION);
+	return true;
+}
+
+void obs_module_unload(void)
+{
+	obs_log(LOG_INFO, "plugin unloaded");
+}
