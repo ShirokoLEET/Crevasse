@@ -10,6 +10,12 @@
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE(PLUGIN_NAME, "en-US")
 
+struct kmboxinfo {
+	char ip[64];
+	int port;
+	char uuid[128];
+	bool enable_remote;
+};
 struct crevasse_filter {
 	obs_source_t *source;
 	gs_texrender_t *texrender = nullptr;
@@ -17,7 +23,9 @@ struct crevasse_filter {
 	uint32_t height = 0;
 	infer *inference = nullptr;
 	std::vector<float> host_output;
+	kmboxinfo kmbox{};
 };
+
 
 static D3D11CudaInterop g_interop = {};
 
@@ -50,6 +58,7 @@ static void filter_destroy(void *data)
 
 static void *filter_create(obs_data_t *settings, obs_source_t *source)
 {
+
 	auto *tf = static_cast<crevasse_filter *>(bzalloc(sizeof(crevasse_filter)));
 
 	tf->source = source;
@@ -224,6 +233,73 @@ static void filter_render(void *data, gs_effect_t *effect)
 	}
 }
 
+static bool connect_kmbox(obs_properties_t *props, obs_property_t *property, void *data)
+{
+	UNUSED_PARAMETER(props);
+	UNUSED_PARAMETER(property);
+
+	auto *tf = static_cast<crevasse_filter *>(data);
+	if (!tf)
+		return false;
+
+	blog(LOG_INFO, "[crevasse] Connecting to kmbox at %s:%d with UUID %s (enable_remote=%d)", tf->kmbox.ip,
+	     tf->kmbox.port, tf->kmbox.uuid, tf->kmbox.enable_remote);
+
+	return true;
+}
+static obs_properties_t *filter_properties(void *data)
+{
+	UNUSED_PARAMETER(data);
+
+	obs_properties_t *props = obs_properties_create();
+
+	obs_properties_add_text(props, "ip_value", "ip", OBS_TEXT_DEFAULT);
+	obs_properties_add_text(props, "port_value", "port", OBS_TEXT_DEFAULT);
+	obs_properties_add_text(props, "uuid_value", "uuid", OBS_TEXT_DEFAULT);
+	obs_properties_add_bool(props, "enable_remote", "enable udp kmbox");
+	obs_properties_add_button(props, "connect_kmbox", "connect kmbox", connect_kmbox);
+
+	return props;
+}
+
+
+
+static void filter_update(void *data, obs_data_t *settings)
+{
+	auto *tf = static_cast<crevasse_filter *>(data);
+	if (!tf || !settings)
+		return;
+
+	const char *ip = obs_data_get_string(settings, "ip_value");
+	const char *port = obs_data_get_string(settings, "port_value");
+	const char *uuid = obs_data_get_string(settings, "uuid_value");
+
+
+	bool enable_remote = obs_data_get_bool(settings, "enable_remote");
+
+	if (ip)
+		snprintf(tf->kmbox.ip, sizeof(tf->kmbox.ip), "%s", ip);
+	else
+		tf->kmbox.ip[0] = '\0';
+
+	if (uuid)
+		snprintf(tf->kmbox.uuid, sizeof(tf->kmbox.uuid), "%s", uuid);
+	else
+		tf->kmbox.uuid[0] = '\0';
+
+	if (port)
+		tf->kmbox.port = atoi(port);
+	else
+		tf->kmbox.port = 0;
+
+	tf->kmbox.enable_remote = enable_remote;
+
+	/* ===== 打日志，确认更新成功 ===== */
+	blog(LOG_INFO, "[crevasse] update settings: ip=%s port=%d uuid=%s enable_remote=%d", tf->kmbox.ip,
+	     tf->kmbox.port, tf->kmbox.uuid, tf->kmbox.enable_remote);
+}
+
+
 struct obs_source_info crevasse_ai;
 
 bool obs_module_load(void)
@@ -235,7 +311,8 @@ bool obs_module_load(void)
 	crevasse_ai.create = filter_create;
 	crevasse_ai.destroy = filter_destroy;
 	crevasse_ai.video_render = filter_render;
-
+	crevasse_ai.get_properties = filter_properties;
+	crevasse_ai.update = filter_update;
 	obs_register_source(&crevasse_ai);
 	obs_log(LOG_INFO, "plugin loaded successfully (version %s)", PLUGIN_VERSION);
 	return true;
