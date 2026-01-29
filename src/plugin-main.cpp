@@ -2,8 +2,10 @@
 #include <plugin-support.h>
 #include <graphics/graphics.h>
 #include <d3d11.h>
+#include <Windows.h>
 #include "d3d_cuda_interop.h"
 #include "infer.h"
+#include "Aim.h"
 #include <cuda_runtime.h>
 #include <vector>
 
@@ -29,6 +31,16 @@ struct crevasse_filter {
 	bool inference_running = false;     // 推理是否正在运行
 	bool inference_initialized = false; // 推理引擎是否已初始化
 	char engine_path[512] = {0};        // 引擎文件路径
+
+	// 瞄准系统
+	Aim *aim = nullptr;
+	uint64_t frame_count = 0; // 帧计数器
+
+	// 自瞄热键配置
+	bool hotkey_left_mouse = false; // 鼠标左键
+	bool hotkey_right_mouse = true; // 鼠标右键 (默认)
+	bool hotkey_xbutton1 = false;   // 侧键1
+	bool hotkey_xbutton2 = false;   // 侧键2
 };
 
 static D3D11CudaInterop g_interop = {};
@@ -57,6 +69,13 @@ static void filter_destroy(void *data)
 		tf->inference = nullptr;
 	}
 
+	// 停止并删除瞄准系统
+	if (tf->aim) {
+		tf->aim->stop();
+		delete tf->aim;
+		tf->aim = nullptr;
+	}
+
 	bfree(tf);
 }
 
@@ -69,6 +88,10 @@ static void *filter_create(obs_data_t *settings, obs_source_t *source)
 	tf->inference_running = false;
 	tf->inference_initialized = false;
 	tf->engine_path[0] = '\0';
+	tf->frame_count = 0;
+
+	// 创建瞄准系统
+	tf->aim = new Aim();
 
 	// 延迟初始化：引擎将在用户点击"开始推理"按钮时初始化
 	blog(LOG_INFO, "[crevasse] Filter created. Waiting for user to start inference.");
@@ -190,40 +213,72 @@ static void filter_render(void *data, gs_effect_t *effect)
 		}
 	}
 
-	// Log inference results periodically (仅在推理运行时输出)
+	// 处理推理结果并发送给瞄准系统 (每帧执行)
 	if (tf->inference_running && tf->inference_initialized) {
-		static int cnt = 0;
-		if (++cnt % 120 == 0) {
-			// Model output: 1x5x8400 (Format: cx, cy, w, h, conf)
-			// Layout: Planar [Channels][Anchors] -> [5][8400]
-			constexpr int kNumAnchors = 8400;
-			constexpr int kNumChannels = 5; // cx, cy, w, h, conf
-			constexpr float kConfThreshold = 0.4f;
+		tf->frame_count++;
 
-			if (tf->host_output.size() >= kNumAnchors * kNumChannels) {
-				const float *data_ptr = tf->host_output.data();
-				const float *conf_data = data_ptr + (4 * kNumAnchors);
+		// Model output: 1x5x8400 (Format: cx, cy, w, h, conf)
+		// Layout: Planar [Channels][Anchors] -> [5][8400]
+		constexpr int kNumAnchors = 8400;
+		constexpr int kNumChannels = 5; // cx, cy, w, h, conf
+		constexpr float kConfThreshold = 0.4f;
 
-				// Find anchor with highest confidence
-				int best_i = -1;
-				float best_conf = kConfThreshold;
+		if (tf->host_output.size() >= kNumAnchors * kNumChannels) {
+			const float *data_ptr = tf->host_output.data();
+			const float *conf_data = data_ptr + (4 * kNumAnchors);
 
-				for (int i = 0; i < kNumAnchors; ++i) {
-					if (conf_data[i] > best_conf) {
-						best_conf = conf_data[i];
-						best_i = i;
-					}
+			// Find anchor with highest confidence
+			int best_i = -1;
+			float best_conf = kConfThreshold;
+
+			for (int i = 0; i < kNumAnchors; ++i) {
+				if (conf_data[i] > best_conf) {
+					best_conf = conf_data[i];
+					best_i = i;
+				}
+			}
+
+			if (best_i >= 0) {
+				// 模型输出的坐标是在裁剪区域 (640x640) 上的
+				// 预处理是从屏幕中心裁剪 640x640，所以只需要加上偏移量
+				const float det_cx = data_ptr[0 * kNumAnchors + best_i];
+				const float det_cy = data_ptr[1 * kNumAnchors + best_i];
+				const float det_w = data_ptr[2 * kNumAnchors + best_i];
+				const float det_h = data_ptr[3 * kNumAnchors + best_i];
+
+				// 中心裁剪的偏移量
+				// offset_x = (screen_width - 640) / 2
+				// offset_y = (screen_height - 640) / 2
+				const int screen_width = GetSystemMetrics(SM_CXSCREEN);
+				const int screen_height = GetSystemMetrics(SM_CYSCREEN);
+				const float offset_x = static_cast<float>((screen_width - 640) / 2);
+				const float offset_y = static_cast<float>((screen_height - 640) / 2);
+
+				// 屏幕坐标 = 偏移量 + 检测坐标 (无需缩放)
+				const float screen_cx = offset_x + det_cx;
+				const float screen_cy = offset_y + det_cy;
+
+				// 发送目标给瞄准系统 (包含宽高用于 Sticky Aim)
+				if (tf->aim) {
+					tf->aim->setTarget(screen_cx, screen_cy, det_w, det_h, best_conf,
+							   tf->frame_count);
 				}
 
-				if (best_i >= 0) {
-					const float cx = data_ptr[0 * kNumAnchors + best_i];
-					const float cy = data_ptr[1 * kNumAnchors + best_i];
-					const float w = data_ptr[2 * kNumAnchors + best_i];
-					const float h = data_ptr[3 * kNumAnchors + best_i];
+				// Debug 输出 (每 120 帧输出一次)
+				static int log_cnt = 0;
+				if (++log_cnt % 120 == 0) {
+					blog(LOG_INFO,
+					     "[crevasse] Best: det(%.1f,%.1f,%.0fx%.0f) -> screen(%.1f,%.1f) conf=%.3f",
+					     det_cx, det_cy, det_w, det_h, screen_cx, screen_cy, best_conf);
+				}
+			} else {
+				// 无检测，清除目标
+				if (tf->aim) {
+					tf->aim->clearTarget();
+				}
 
-					blog(LOG_INFO, "[crevasse] Best: cx=%.1f cy=%.1f w=%.1f h=%.1f conf=%.3f", cx,
-					     cy, w, h, best_conf);
-				} else {
+				static int no_det_cnt = 0;
+				if (++no_det_cnt % 120 == 0) {
 					blog(LOG_INFO, "[crevasse] No detection above threshold %.2f", kConfThreshold);
 				}
 			}
@@ -266,10 +321,22 @@ static bool start_infer_clicked(obs_properties_t *props, obs_property_t *propert
 		}
 
 		tf->inference_running = true;
+
+		// 启动瞄准线程
+		if (tf->aim) {
+			tf->aim->start();
+		}
+
 		blog(LOG_INFO, "[crevasse] Inference STARTED");
 	} else {
 		// 停止推理
 		tf->inference_running = false;
+
+		// 停止瞄准线程
+		if (tf->aim) {
+			tf->aim->stop();
+		}
+
 		blog(LOG_INFO, "[crevasse] Inference STOPPED");
 	}
 
@@ -299,17 +366,30 @@ static bool connect_kmbox(obs_properties_t *props, obs_property_t *property, voi
 
 static obs_properties_t *filter_properties(void *data)
 {
-	UNUSED_PARAMETER(data);
+	auto *tf = static_cast<crevasse_filter *>(data);
 
 	obs_properties_t *props = obs_properties_create();
 	obs_properties_add_path(props, "engine_path", "TensorRT Engine file", OBS_PATH_FILE, "Engine File (*.engine)",
 				NULL);
+
+	// 自瞄热键设置
+	obs_properties_add_bool(props, "hotkey_left_mouse", "Aim Hotkey: Left Mouse");
+	obs_properties_add_bool(props, "hotkey_right_mouse", "Aim Hotkey: Right Mouse");
+	obs_properties_add_bool(props, "hotkey_xbutton1", "Aim Hotkey: Side Button 1 (XBUTTON1)");
+	obs_properties_add_bool(props, "hotkey_xbutton2", "Aim Hotkey: Side Button 2 (XBUTTON2)");
+
 	obs_properties_add_text(props, "ip_value", "IP", OBS_TEXT_DEFAULT);
 	obs_properties_add_text(props, "port_value", "PORT", OBS_TEXT_DEFAULT);
 	obs_properties_add_text(props, "uuid_value", "UUID", OBS_TEXT_DEFAULT);
 	obs_properties_add_bool(props, "enable_remote", "Enable udp kmbox");
 	obs_properties_add_button(props, "connect_kmbox", "Connect kmbox", connect_kmbox);
-	obs_properties_add_button(props, "start_infer", "Start Infer", start_infer_clicked);
+
+	// 根据当前推理状态设置按钮文字
+	const char *infer_btn_text = "Start Infer";
+	if (tf && tf->inference_running) {
+		infer_btn_text = "Stop Infer";
+	}
+	obs_properties_add_button(props, "start_infer", infer_btn_text, start_infer_clicked);
 
 	return props;
 }
@@ -379,8 +459,22 @@ static void filter_update(void *data, obs_data_t *settings)
 		}
 	}
 
-	blog(LOG_INFO, "[crevasse] update settings: ip=%s port=%d uuid=%s enable_remote=%d engine=%s", tf->kmbox.ip,
-	     tf->kmbox.port, tf->kmbox.uuid, tf->kmbox.enable_remote, tf->engine_path);
+	// 读取热键配置
+	tf->hotkey_left_mouse = obs_data_get_bool(settings, "hotkey_left_mouse");
+	tf->hotkey_right_mouse = obs_data_get_bool(settings, "hotkey_right_mouse");
+	tf->hotkey_xbutton1 = obs_data_get_bool(settings, "hotkey_xbutton1");
+	tf->hotkey_xbutton2 = obs_data_get_bool(settings, "hotkey_xbutton2");
+
+	// 更新 Aim 的热键配置
+	if (tf->aim) {
+		tf->aim->setHotkeys(tf->hotkey_left_mouse, tf->hotkey_right_mouse, tf->hotkey_xbutton1,
+				    tf->hotkey_xbutton2);
+	}
+
+	blog(LOG_INFO,
+	     "[crevasse] update settings: ip=%s port=%d uuid=%s enable_remote=%d engine=%s hotkeys=L%d/R%d/X1%d/X2%d",
+	     tf->kmbox.ip, tf->kmbox.port, tf->kmbox.uuid, tf->kmbox.enable_remote, tf->engine_path,
+	     tf->hotkey_left_mouse, tf->hotkey_right_mouse, tf->hotkey_xbutton1, tf->hotkey_xbutton2);
 }
 
 struct obs_source_info crevasse_ai;
