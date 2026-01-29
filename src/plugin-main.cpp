@@ -24,8 +24,12 @@ struct crevasse_filter {
 	infer *inference = nullptr;
 	std::vector<float> host_output;
 	kmboxinfo kmbox{};
-};
 
+	// 推理控制
+	bool inference_running = false;     // 推理是否正在运行
+	bool inference_initialized = false; // 推理引擎是否已初始化
+	char engine_path[512] = {0};        // 引擎文件路径
+};
 
 static D3D11CudaInterop g_interop = {};
 
@@ -58,20 +62,16 @@ static void filter_destroy(void *data)
 
 static void *filter_create(obs_data_t *settings, obs_source_t *source)
 {
-
 	auto *tf = static_cast<crevasse_filter *>(bzalloc(sizeof(crevasse_filter)));
 
 	tf->source = source;
 	tf->inference = new infer();
+	tf->inference_running = false;
+	tf->inference_initialized = false;
+	tf->engine_path[0] = '\0';
 
-	// Hardcoded model path for now - normally this would come from settings
-	// Assuming the user will place the engine file here for testing
-	if (!tf->inference->init("D:\\model.engine")) {
-		blog(LOG_ERROR, "[crevasse] Failed to init inference engine");
-	} else {
-		// Output size 1x5x8400
-		tf->host_output.resize(1 * 5 * 8400);
-	}
+	// 延迟初始化：引擎将在用户点击"开始推理"按钮时初始化
+	blog(LOG_INFO, "[crevasse] Filter created. Waiting for user to start inference.");
 
 	UNUSED_PARAMETER(settings);
 	return tf;
@@ -171,16 +171,18 @@ static void filter_render(void *data, gs_effect_t *effect)
 				}
 			}
 
-			// Register for CUDA interop and run inference
-			if (register_d3d11_texture(d3d_tex, g_interop)) {
-				if (tf->inference) {
-					tf->inference->forward(g_interop, tf->host_output.data());
+			// Register for CUDA interop and run inference (仅在推理运行时执行)
+			if (tf->inference_running && tf->inference_initialized) {
+				if (register_d3d11_texture(d3d_tex, g_interop)) {
+					if (tf->inference) {
+						tf->inference->forward(g_interop, tf->host_output.data());
+					}
+				} else {
+					const cudaError_t last = cudaGetLastError();
+					obs_log(LOG_ERROR,
+						"[crevasse] Failed to register D3D11 texture for CUDA interop (tex=%p, cuda=%d: %s)",
+						d3d_tex, static_cast<int>(last), cudaGetErrorString(last));
 				}
-			} else {
-				const cudaError_t last = cudaGetLastError();
-				obs_log(LOG_ERROR,
-					"[crevasse] Failed to register D3D11 texture for CUDA interop (tex=%p, cuda=%d: %s)",
-					d3d_tex, static_cast<int>(last), cudaGetErrorString(last));
 			}
 
 			ctx->Release();
@@ -188,40 +190,42 @@ static void filter_render(void *data, gs_effect_t *effect)
 		}
 	}
 
-	// Log inference results periodically
-	static int cnt = 0;
-	if (++cnt % 120 == 0) {
-		// Model output: 1x5x8400 (Format: cx, cy, w, h, conf)
-		// Layout: Planar [Channels][Anchors] -> [5][8400]
-		constexpr int kNumAnchors = 8400;
-		constexpr int kNumChannels = 5; // cx, cy, w, h, conf
-		constexpr float kConfThreshold = 0.4f;
+	// Log inference results periodically (仅在推理运行时输出)
+	if (tf->inference_running && tf->inference_initialized) {
+		static int cnt = 0;
+		if (++cnt % 120 == 0) {
+			// Model output: 1x5x8400 (Format: cx, cy, w, h, conf)
+			// Layout: Planar [Channels][Anchors] -> [5][8400]
+			constexpr int kNumAnchors = 8400;
+			constexpr int kNumChannels = 5; // cx, cy, w, h, conf
+			constexpr float kConfThreshold = 0.4f;
 
-		if (tf->host_output.size() >= kNumAnchors * kNumChannels) {
-			const float *data_ptr = tf->host_output.data();
-			const float *conf_data = data_ptr + (4 * kNumAnchors);
+			if (tf->host_output.size() >= kNumAnchors * kNumChannels) {
+				const float *data_ptr = tf->host_output.data();
+				const float *conf_data = data_ptr + (4 * kNumAnchors);
 
-			// Find anchor with highest confidence
-			int best_i = -1;
-			float best_conf = kConfThreshold;
+				// Find anchor with highest confidence
+				int best_i = -1;
+				float best_conf = kConfThreshold;
 
-			for (int i = 0; i < kNumAnchors; ++i) {
-				if (conf_data[i] > best_conf) {
-					best_conf = conf_data[i];
-					best_i = i;
+				for (int i = 0; i < kNumAnchors; ++i) {
+					if (conf_data[i] > best_conf) {
+						best_conf = conf_data[i];
+						best_i = i;
+					}
 				}
-			}
 
-			if (best_i >= 0) {
-				const float cx = data_ptr[0 * kNumAnchors + best_i];
-				const float cy = data_ptr[1 * kNumAnchors + best_i];
-				const float w = data_ptr[2 * kNumAnchors + best_i];
-				const float h = data_ptr[3 * kNumAnchors + best_i];
+				if (best_i >= 0) {
+					const float cx = data_ptr[0 * kNumAnchors + best_i];
+					const float cy = data_ptr[1 * kNumAnchors + best_i];
+					const float w = data_ptr[2 * kNumAnchors + best_i];
+					const float h = data_ptr[3 * kNumAnchors + best_i];
 
-				blog(LOG_INFO, "[crevasse] Best: cx=%.1f cy=%.1f w=%.1f h=%.1f conf=%.3f", cx, cy, w, h,
-				     best_conf);
-			} else {
-				blog(LOG_INFO, "[crevasse] No detection above threshold %.2f", kConfThreshold);
+					blog(LOG_INFO, "[crevasse] Best: cx=%.1f cy=%.1f w=%.1f h=%.1f conf=%.3f", cx,
+					     cy, w, h, best_conf);
+				} else {
+					blog(LOG_INFO, "[crevasse] No detection above threshold %.2f", kConfThreshold);
+				}
 			}
 		}
 	}
@@ -231,6 +235,51 @@ static void filter_render(void *data, gs_effect_t *effect)
 	if (obs_source_process_filter_begin(tf->source, GS_RGBA, OBS_ALLOW_DIRECT_RENDERING)) {
 		obs_source_process_filter_end(tf->source, default_effect, cx, cy);
 	}
+}
+
+static bool start_infer_clicked(obs_properties_t *props, obs_property_t *property, void *data)
+{
+	UNUSED_PARAMETER(property);
+
+	auto *tf = static_cast<crevasse_filter *>(data);
+	if (!tf)
+		return false;
+
+	// 切换推理状态
+	if (!tf->inference_running) {
+		// 开始推理
+		if (tf->engine_path[0] == '\0') {
+			blog(LOG_WARNING, "[crevasse] Cannot start: engine path not set");
+			return false;
+		}
+
+		// 如果引擎未初始化，先初始化
+		if (!tf->inference_initialized) {
+			if (tf->inference && tf->inference->init(tf->engine_path)) {
+				tf->inference_initialized = true;
+				tf->host_output.resize(1 * 5 * 8400);
+				blog(LOG_INFO, "[crevasse] Inference engine initialized: %s", tf->engine_path);
+			} else {
+				blog(LOG_ERROR, "[crevasse] Failed to init engine: %s", tf->engine_path);
+				return false;
+			}
+		}
+
+		tf->inference_running = true;
+		blog(LOG_INFO, "[crevasse] Inference STARTED");
+	} else {
+		// 停止推理
+		tf->inference_running = false;
+		blog(LOG_INFO, "[crevasse] Inference STOPPED");
+	}
+
+	// 更新按钮文字
+	obs_property_t *btn = obs_properties_get(props, "start_infer");
+	if (btn) {
+		obs_property_set_description(btn, tf->inference_running ? "Stop Infer" : "Start Infer");
+	}
+
+	return true; // 刷新 UI
 }
 
 static bool connect_kmbox(obs_properties_t *props, obs_property_t *property, void *data)
@@ -247,22 +296,23 @@ static bool connect_kmbox(obs_properties_t *props, obs_property_t *property, voi
 
 	return true;
 }
+
 static obs_properties_t *filter_properties(void *data)
 {
 	UNUSED_PARAMETER(data);
 
 	obs_properties_t *props = obs_properties_create();
-
-	obs_properties_add_text(props, "ip_value", "ip", OBS_TEXT_DEFAULT);
-	obs_properties_add_text(props, "port_value", "port", OBS_TEXT_DEFAULT);
-	obs_properties_add_text(props, "uuid_value", "uuid", OBS_TEXT_DEFAULT);
-	obs_properties_add_bool(props, "enable_remote", "enable udp kmbox");
-	obs_properties_add_button(props, "connect_kmbox", "connect kmbox", connect_kmbox);
+	obs_properties_add_path(props, "engine_path", "TensorRT Engine file", OBS_PATH_FILE, "Engine File (*.engine)",
+				NULL);
+	obs_properties_add_text(props, "ip_value", "IP", OBS_TEXT_DEFAULT);
+	obs_properties_add_text(props, "port_value", "PORT", OBS_TEXT_DEFAULT);
+	obs_properties_add_text(props, "uuid_value", "UUID", OBS_TEXT_DEFAULT);
+	obs_properties_add_bool(props, "enable_remote", "Enable udp kmbox");
+	obs_properties_add_button(props, "connect_kmbox", "Connect kmbox", connect_kmbox);
+	obs_properties_add_button(props, "start_infer", "Start Infer", start_infer_clicked);
 
 	return props;
 }
-
-
 
 static void filter_update(void *data, obs_data_t *settings)
 {
@@ -273,7 +323,7 @@ static void filter_update(void *data, obs_data_t *settings)
 	const char *ip = obs_data_get_string(settings, "ip_value");
 	const char *port = obs_data_get_string(settings, "port_value");
 	const char *uuid = obs_data_get_string(settings, "uuid_value");
-
+	const char *engine = obs_data_get_string(settings, "engine_path");
 
 	bool enable_remote = obs_data_get_bool(settings, "enable_remote");
 
@@ -294,11 +344,44 @@ static void filter_update(void *data, obs_data_t *settings)
 
 	tf->kmbox.enable_remote = enable_remote;
 
-	/* ===== 打日志，确认更新成功 ===== */
-	blog(LOG_INFO, "[crevasse] update settings: ip=%s port=%d uuid=%s enable_remote=%d", tf->kmbox.ip,
-	     tf->kmbox.port, tf->kmbox.uuid, tf->kmbox.enable_remote);
-}
+	// 处理引擎路径变更
+	if (engine && engine[0] != '\0') {
+		// 检查路径是否变更
+		if (strcmp(tf->engine_path, engine) != 0) {
+			snprintf(tf->engine_path, sizeof(tf->engine_path), "%s", engine);
+			blog(LOG_INFO, "[crevasse] Engine path changed: %s", tf->engine_path);
 
+			// 如果正在运行推理，需要重新初始化
+			if (tf->inference_running && tf->inference_initialized) {
+				blog(LOG_INFO, "[crevasse] Reloading inference engine...");
+				tf->inference_running = false;
+
+				// 删除旧的推理引擎并创建新的
+				if (tf->inference) {
+					delete tf->inference;
+					tf->inference = new infer();
+				}
+				tf->inference_initialized = false;
+
+				// 重新初始化
+				if (tf->inference->init(tf->engine_path)) {
+					tf->inference_initialized = true;
+					tf->host_output.resize(1 * 5 * 8400);
+					tf->inference_running = true;
+					blog(LOG_INFO, "[crevasse] Engine reloaded successfully");
+				} else {
+					blog(LOG_ERROR, "[crevasse] Failed to reload engine");
+				}
+			} else {
+				// 如果未运行，标记需要重新初始化
+				tf->inference_initialized = false;
+			}
+		}
+	}
+
+	blog(LOG_INFO, "[crevasse] update settings: ip=%s port=%d uuid=%s enable_remote=%d engine=%s", tf->kmbox.ip,
+	     tf->kmbox.port, tf->kmbox.uuid, tf->kmbox.enable_remote, tf->engine_path);
+}
 
 struct obs_source_info crevasse_ai;
 
